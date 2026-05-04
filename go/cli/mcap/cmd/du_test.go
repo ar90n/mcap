@@ -231,9 +231,10 @@ func TestDuFromIndexFallbackNoSummary(t *testing.T) {
 		Chunked: false,
 	}, messages, channels)
 
-	// runDuFromIndex should fall back and not error.
-	err := runDuFromIndex(bytes.NewReader(data))
+	// computeDuApprox should fall back and not error.
+	stats, err := computeDuApprox(bytes.NewReader(data))
 	require.NoError(t, err)
+	require.NotNil(t, stats)
 }
 
 func TestDuFromIndexMultipleChannelsPerChunk(t *testing.T) {

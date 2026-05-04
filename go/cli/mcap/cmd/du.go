@@ -218,9 +218,6 @@ func (instance *usage) RunDu() error {
 		}
 	}
 
-	printRecordTable(instance.recordKindSize, instance.totalSize, false)
-	printTopicTable(instance.topicMessageSize, instance.totalMessageSize)
-
 	return nil
 }
 
@@ -316,51 +313,93 @@ func printTopicTable(topicMessageSize map[string]uint64, totalMessageSize uint64
 	utils.FormatTable(os.Stdout, rows)
 }
 
-// Reads only the summary section and message indexes to compute
-// space usage without decompressing any chunk data. Used by --approximate.
-func runDuFromIndex(rs io.ReadSeeker) error {
-	// Get file size.
+// duStats holds the aggregated output of a du computation for either a
+// single mcap file or a logical multi-file source. recordKindTotal is
+// the denominator used for the record-kind percentages: for the exact
+// path it is the sum of record content bytes, for the approximate path
+// it is the on-disk file size.
+type duStats struct {
+	recordKindSize    map[string]uint64
+	recordKindTotal   uint64
+	topicMessageSize  map[string]uint64
+	totalMessageSize  uint64
+}
+
+func newDuStats() *duStats {
+	return &duStats{
+		recordKindSize:   map[string]uint64{},
+		topicMessageSize: map[string]uint64{},
+	}
+}
+
+func (s *duStats) merge(other *duStats) {
+	if other == nil {
+		return
+	}
+	for k, v := range other.recordKindSize {
+		s.recordKindSize[k] += v
+	}
+	s.recordKindTotal += other.recordKindTotal
+	for k, v := range other.topicMessageSize {
+		s.topicMessageSize[k] += v
+	}
+	s.totalMessageSize += other.totalMessageSize
+}
+
+func (s *duStats) print(approximate bool) {
+	printRecordTable(s.recordKindSize, s.recordKindTotal, approximate)
+	printTopicTable(s.topicMessageSize, s.totalMessageSize)
+}
+
+// computeDuExact runs the full-scan du and returns the result without printing.
+func computeDuExact(rs io.ReadSeeker) (*duStats, error) {
+	u := newUsage(rs)
+	if err := u.RunDu(); err != nil {
+		return nil, err
+	}
+	return &duStats{
+		recordKindSize:   u.recordKindSize,
+		recordKindTotal:  u.totalSize,
+		topicMessageSize: u.topicMessageSize,
+		totalMessageSize: u.totalMessageSize,
+	}, nil
+}
+
+// computeDuApprox computes du using only the summary section and message
+// indexes. Falls back to computeDuExact when the file lacks a usable
+// summary section. Returns nil and a sentinel value to indicate the
+// approximate path could not be used and the caller should use the
+// exact result instead.
+func computeDuApprox(rs io.ReadSeeker) (*duStats, error) {
 	fileSize, err := rs.Seek(0, io.SeekEnd)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := rs.Seek(0, io.SeekStart); err != nil {
-		return err
+		return nil, err
 	}
 
 	reader, err := mcap.NewReader(rs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer reader.Close()
 
 	info, err := reader.Info()
 	if err != nil {
-		// If we can't read the summary section, fall back to full scan.
-		// Safe to reuse rs: mcap.NewReader does not take exclusive ownership
-		// of the underlying stream, so seeking back to the start is valid
-		// even with reader.Close() deferred.
 		if _, seekErr := rs.Seek(0, io.SeekStart); seekErr != nil {
-			return seekErr
+			return nil, seekErr
 		}
-		u := newUsage(rs)
-		return u.RunDu()
+		return computeDuExact(rs)
 	}
 
-	// If no summary section or no chunk indexes, fall back to full scan.
-	// See above comment re: safety of reusing rs.
 	if info.Footer == nil || info.Footer.SummaryStart == 0 || len(info.ChunkIndexes) == 0 {
 		if _, seekErr := rs.Seek(0, io.SeekStart); seekErr != nil {
-			return seekErr
+			return nil, seekErr
 		}
-		u := newUsage(rs)
-		return u.RunDu()
+		return computeDuExact(rs)
 	}
 
-	// Compute Table 1: record-type breakdown from ChunkIndex metadata.
-	// We use on-disk byte sizes and the actual file size as the denominator
-	// for percentages (slightly different accounting from the default path,
-	// which uses record content sizes only).
 	totalFileSize := uint64(fileSize)
 	recordKindSize := make(map[string]uint64)
 	var totalChunkOnDisk, totalMIOnDisk uint64
@@ -380,26 +419,18 @@ func runDuFromIndex(rs io.ReadSeeker) error {
 			recordKindSize["summary section"] = footerStart - info.Footer.SummaryStart
 		}
 	}
-	// "other" = magic + header + DataEnd + footer + any unchunked records in
-	// the data section. Computed as the remainder after chunks, message
-	// indexes, and summary section.
-	// Guard against uint64 underflow: if metadata is inconsistent with the
-	// file size (e.g. corrupted file), the subtraction would wrap silently.
 	accounted := totalChunkOnDisk + totalMIOnDisk
 	if summary, ok := recordKindSize["summary section"]; ok {
 		accounted += summary
 	}
 	if accounted > totalFileSize {
-		return fmt.Errorf("chunk index metadata exceeds file size (%d > %d)", accounted, totalFileSize)
+		return nil, fmt.Errorf("chunk index metadata exceeds file size (%d > %d)", accounted, totalFileSize)
 	}
 	other := totalFileSize - accounted
 	if other > 0 {
 		recordKindSize["other"] = other
 	}
 
-	printRecordTable(recordKindSize, totalFileSize, true)
-
-	// Compute Table 2: per-topic message sizes from MessageIndex records.
 	channelTopics := make(map[uint16]string)
 	for id, ch := range info.Channels {
 		channelTopics[id] = ch.Topic
@@ -407,12 +438,15 @@ func runDuFromIndex(rs io.ReadSeeker) error {
 
 	topicSizes, totalMsgSize, err := computeTopicSizesFromIndex(rs, info.ChunkIndexes, channelTopics)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	printTopicTable(topicSizes, totalMsgSize)
-
-	return nil
+	return &duStats{
+		recordKindSize:   recordKindSize,
+		recordKindTotal:  totalFileSize,
+		topicMessageSize: topicSizes,
+		totalMessageSize: totalMsgSize,
+	}, nil
 }
 
 // computeTopicSizesFromIndex reads MessageIndex records from disk (in parallel
@@ -672,11 +706,30 @@ func parseChunkMessageIndexes(
 
 var duApproximate bool
 
+// computeDuFor runs the chosen du computation against a single mcap source.
+func computeDuFor(ctx context.Context, location string, approximate bool) (*duStats, error) {
+	var stats *duStats
+	err := utils.WithReader(ctx, location, func(_ bool, rs io.ReadSeeker) error {
+		var err error
+		if approximate {
+			stats, err = computeDuApprox(rs)
+		} else {
+			stats, err = computeDuExact(rs)
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
 var duCmd = &cobra.Command{
 	Use:   "du <file>",
-	Short: "Report space usage within an MCAP file",
+	Short: "Report space usage within an MCAP file or rosbag2 metadata.yaml",
 	Long: `This command reports space usage within an mcap file. Space usage for messages is
-calculated using the uncompressed size.
+calculated using the uncompressed size. When given a rosbag2 metadata.yaml, the
+results are summed across all referenced mcap shards.
 
 Use --approximate for a faster approximation that skips chunk decompression. It may
 over-count per-topic message sizes when non-message records (Schema, Channel)
@@ -687,16 +740,21 @@ are interleaved between messages within a chunk.`,
 			die("Unexpected number of args")
 		}
 		filename := args[0]
-		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-			if duApproximate {
-				return runDuFromIndex(rs)
-			}
-			u := newUsage(rs)
-			return u.RunDu()
-		})
+
+		files, err := utils.ResolveSourceFiles(ctx, filename)
 		if err != nil {
-			die("Failed to read file %s: %v", filename, err)
+			die("Failed to resolve %s: %v", filename, err)
 		}
+
+		total := newDuStats()
+		for _, f := range files {
+			stats, err := computeDuFor(ctx, f, duApproximate)
+			if err != nil {
+				die("Failed to read file %s: %v", f, err)
+			}
+			total.merge(stats)
+		}
+		total.print(duApproximate)
 	},
 }
 
