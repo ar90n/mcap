@@ -697,6 +697,23 @@ func newMcapDoctor(reader io.ReadSeeker) *mcapDoctor {
 	}
 }
 
+// examineSingle runs the doctor over one mcap file.
+func examineSingle(ctx context.Context, filename string) (errCount int, runErr error) {
+	err := utils.WithReader(ctx, filename, func(remote bool, rs io.ReadSeeker) error {
+		doctor := newMcapDoctor(rs)
+		if remote {
+			color.Yellow("Will read full remote file")
+		}
+		if verbose {
+			fmt.Printf("Examining %s\n", filename)
+		}
+		diagnosis := doctor.Examine()
+		errCount = len(diagnosis.Errors)
+		return nil
+	})
+	return errCount, err
+}
+
 func main(_ *cobra.Command, args []string) {
 	ctx := context.Background()
 	if len(args) != 1 {
@@ -704,22 +721,31 @@ func main(_ *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	filename := args[0]
-	err := utils.WithReader(ctx, filename, func(remote bool, rs io.ReadSeeker) error {
-		doctor := newMcapDoctor(rs)
-		if remote {
-			color.Yellow("Will read full remote file")
-		}
-		if verbose {
-			fmt.Printf("Examining %s\n", args[0])
-		}
-		diagnosis := doctor.Examine()
-		if len(diagnosis.Errors) > 0 {
-			return fmt.Errorf("encountered %d errors", len(diagnosis.Errors))
-		}
-		return nil
-	})
+
+	files, err := utils.ResolveSourceFiles(ctx, filename)
 	if err != nil {
-		die("Doctor command failed: %s", err)
+		die("Failed to resolve %s: %v", filename, err)
+	}
+	totalErrors := 0
+	multi := len(files) > 1
+	for i, f := range files {
+		if multi {
+			if i > 0 {
+				fmt.Println()
+			}
+			fmt.Printf("=== %s ===\n", f)
+		}
+		errs, err := examineSingle(ctx, f)
+		if err != nil {
+			die("Doctor command failed on %s: %s", f, err)
+		}
+		totalErrors += errs
+	}
+	if totalErrors > 0 {
+		if multi {
+			die("Doctor command failed: encountered %d errors across %d files", totalErrors, len(files))
+		}
+		die("Doctor command failed: encountered %d errors", totalErrors)
 	}
 }
 
