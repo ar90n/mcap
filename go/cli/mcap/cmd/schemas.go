@@ -135,17 +135,17 @@ var schemasCmd = &cobra.Command{
 			die("Unexpected number of args")
 		}
 		filename := args[0]
+		newReader := utils.NewMCAPReader(ctx, filename)
 		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-			reader, err := mcap.NewReader(rs)
+			reader, err := newReader(rs)
 			if err != nil {
-				return fmt.Errorf("failed to get reader: %w", err)
+				return fmt.Errorf("failed to create mcap reader: %w", err)
 			}
 			defer reader.Close()
 			info, err := reader.Info()
 			if err != nil {
 				return fmt.Errorf("failed to get info: %w", err)
 			}
-
 			schemas := []*mcap.Schema{}
 			for _, schema := range info.Schemas {
 				schemas = append(schemas, schema)

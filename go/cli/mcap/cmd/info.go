@@ -331,23 +331,20 @@ var infoCmd = &cobra.Command{
 		if len(args) != 1 {
 			die("Unexpected number of args")
 		}
-		// check if it's a remote file
 		filename := args[0]
+
+		newReader := utils.NewMCAPReader(ctx, filename)
 		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-			reader, err := mcap.NewReader(rs)
+			reader, err := newReader(rs)
 			if err != nil {
-				return fmt.Errorf("failed to get reader: %w", err)
+				return fmt.Errorf("failed to create mcap reader: %w", err)
 			}
 			defer reader.Close()
 			info, err := reader.Info()
 			if err != nil {
 				return fmt.Errorf("failed to get info: %w", err)
 			}
-			err = printInfo(os.Stdout, info)
-			if err != nil {
-				return fmt.Errorf("failed to print info: %w", err)
-			}
-			return nil
+			return printInfo(os.Stdout, info)
 		})
 		if err != nil {
 			die("Failed to read file %s: %v", filename, err)

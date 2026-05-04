@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"strings"
 
@@ -23,7 +22,7 @@ var (
 	getMetadataName string
 )
 
-func printMetadata(w io.Writer, r io.ReadSeeker, info *mcap.Info) error {
+func printMetadata(w io.Writer, reader utils.MCAPReader, info *mcap.Info) error {
 	rows := make([][]string, 0, len(info.MetadataIndexes))
 	rows = append(rows, []string{
 		"name",
@@ -32,24 +31,10 @@ func printMetadata(w io.Writer, r io.ReadSeeker, info *mcap.Info) error {
 		"metadata",
 	})
 	for _, idx := range info.MetadataIndexes {
-		offset := idx.Offset + 1 + 8
-		if offset > math.MaxInt64 {
-			return fmt.Errorf("metadata offset out of range: %v", offset)
-		}
-		_, err := r.Seek(int64(offset), io.SeekStart)
-		if err != nil {
-			return fmt.Errorf("failed to seek to metadata record: %w", err)
-		}
-		record := make([]byte, idx.Length)
-		_, err = r.Read(record)
+		metadata, err := reader.GetMetadata(idx.Offset)
 		if err != nil {
 			return fmt.Errorf("failed to read metadata record: %w", err)
 		}
-		metadata, err := mcap.ParseMetadata(record)
-		if err != nil {
-			return fmt.Errorf("failed to parse metadata: %w", err)
-		}
-
 		jsonSerialized, err := json.Marshal(metadata.Metadata)
 		if err != nil {
 			return fmt.Errorf("failed to marshal metadata to JSON: %w", err)
@@ -74,8 +59,9 @@ var listMetadataCmd = &cobra.Command{
 			die("Unexpected number of args")
 		}
 		filename := args[0]
+		newReader := utils.NewMCAPReader(ctx, filename)
 		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-			reader, err := mcap.NewReader(rs)
+			reader, err := newReader(rs)
 			if err != nil {
 				return fmt.Errorf("failed to build mcap reader: %w", err)
 			}
@@ -84,7 +70,7 @@ var listMetadataCmd = &cobra.Command{
 			if err != nil {
 				return fmt.Errorf("failed to read info: %w", err)
 			}
-			return printMetadata(os.Stdout, rs, info)
+			return printMetadata(os.Stdout, reader, info)
 		})
 		if err != nil {
 			die("failed to list metadata: %s", err)
@@ -141,12 +127,7 @@ var getMetadataCmd = &cobra.Command{
 			die("Unexpected number of args")
 		}
 		filename := args[0]
-		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-			reader, err := mcap.NewReader(rs)
-			if err != nil {
-				return fmt.Errorf("failed to build reader: %w", err)
-			}
-			defer reader.Close()
+		extract := func(reader utils.MCAPReader) error {
 			info, err := reader.Info()
 			if err != nil {
 				return fmt.Errorf("failed to collect mcap info: %w", err)
@@ -164,18 +145,9 @@ var getMetadataCmd = &cobra.Command{
 			}
 
 			for _, idx := range indexes {
-				_, err = rs.Seek(int64(idx.Offset+1+8), io.SeekStart)
+				record, err := reader.GetMetadata(idx.Offset)
 				if err != nil {
-					return fmt.Errorf("failed to seek to metadata record at %d: %w", idx.Offset, err)
-				}
-				data := make([]byte, idx.Length)
-				_, err = io.ReadFull(rs, data)
-				if err != nil {
-					return fmt.Errorf("failed to read metadata record: %w", err)
-				}
-				record, err := mcap.ParseMetadata(data)
-				if err != nil {
-					return fmt.Errorf("failed to parse metadata: %w", err)
+					return fmt.Errorf("failed to read metadata record at %d: %w", idx.Offset, err)
 				}
 				for k, v := range record.Metadata {
 					output[k] = v
@@ -195,6 +167,15 @@ var getMetadataCmd = &cobra.Command{
 				return fmt.Errorf("failed to write metadata to output: %w", err)
 			}
 			return nil
+		}
+		newReader := utils.NewMCAPReader(ctx, filename)
+		err := utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
+			reader, err := newReader(rs)
+			if err != nil {
+				return fmt.Errorf("failed to build reader: %w", err)
+			}
+			defer reader.Close()
+			return extract(reader)
 		})
 		if err != nil {
 			die("failed to fetch metadata: %s", err)

@@ -350,8 +350,9 @@ var catCmd = &cobra.Command{
 		}
 
 		for _, filename := range args {
+			newReader := utils.NewMCAPReader(ctx, filename)
 			err = utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-				reader, err := mcap.NewReader(rs)
+				reader, err := newReader(rs)
 				if err != nil {
 					return fmt.Errorf("failed to create reader from %s: %w", filename, err)
 				}
@@ -360,8 +361,7 @@ var catCmd = &cobra.Command{
 				if err != nil {
 					return fmt.Errorf("failed to read messages from %s: %w", filename, err)
 				}
-				err = printMessages(output, it, catFormatJSON)
-				if err != nil {
+				if err := printMessages(output, it, catFormatJSON); err != nil {
 					return fmt.Errorf("failed to print messages from %s: %w", filename, err)
 				}
 				return nil

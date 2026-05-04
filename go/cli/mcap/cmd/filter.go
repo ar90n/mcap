@@ -140,30 +140,6 @@ func buildFilterOptions(flags *filterFlags) (*filterOpts, error) {
 }
 
 func run(filterOptions *filterOpts, args []string) {
-	var reader io.Reader
-	if len(args) == 0 {
-		stat, err := os.Stdin.Stat()
-		if err != nil {
-			die("failed to check stdin state: %s", err)
-		}
-		if stat.Mode()&os.ModeCharDevice == 0 {
-			reader = os.Stdin
-		} else {
-			die("please supply a file. see --help for usage details.")
-		}
-	} else {
-		closeFile, newReader, err := utils.GetReader(context.Background(), args[0])
-		if err != nil {
-			die("failed to open source for reading: %s", err)
-		}
-		defer func() {
-			if closeErr := closeFile(); closeErr != nil {
-				die("error closing read source: %s", closeErr)
-			}
-		}()
-		reader = newReader
-	}
-
 	var writer io.Writer
 	if filterOptions.output == "" {
 		if !utils.StdoutRedirected() {
@@ -183,10 +159,66 @@ func run(filterOptions *filterOpts, args []string) {
 		writer = newWriter
 	}
 
-	err := filter(reader, writer, filterOptions)
+	if len(args) == 0 {
+		// No file argument: only stdin streaming mode is supported.
+		stat, err := os.Stdin.Stat()
+		if err != nil {
+			die("failed to check stdin state: %s", err)
+		}
+		if stat.Mode()&os.ModeCharDevice == 0 {
+			if err := filter(os.Stdin, writer, filterOptions); err != nil {
+				die("failed to filter: %s", err)
+			}
+			return
+		}
+		die("please supply a file. see --help for usage details.")
+	}
+
+	// File or rosbag2 metadata.yaml input: utils.NewMCAPReader picks
+	// the appropriate constructor based on the path.
+	ctx := context.Background()
+	newReader := utils.NewMCAPReader(ctx, args[0])
+	err := utils.WithReader(ctx, args[0], func(_ bool, rs io.ReadSeeker) error {
+		reader, err := newReader(rs)
+		if err != nil {
+			return fmt.Errorf("failed to create reader: %w", err)
+		}
+		defer reader.Close()
+		return filterFromReader(reader, writer, filterOptions)
+	})
 	if err != nil {
 		die("failed to filter: %s", err)
 	}
+}
+
+// filterFromReader runs the seekable filter path against an MCAPReader. If
+// the reader's Info indicates no usable index (uncommon for a file-backed
+// source), this falls back to a streaming filter using WithReader so that
+// stdin-style streaming logic can run over a single mcap.
+func filterFromReader(reader utils.MCAPReader, w io.Writer, opts *filterOpts) error {
+	mcapWriter, err := mcap.NewWriter(w, &mcap.WriterOptions{
+		Compression: opts.compressionFormat,
+		Chunked:     !opts.unchunked,
+		ChunkSize:   opts.chunkSize,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create mcap writer: %w", err)
+	}
+	info, err := reader.Info()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+	if !info.CanReadMessagesUsingIndex() {
+		return errors.New("file contains no message index, cannot filter; " +
+			"recover or re-record the file with chunk indexes")
+	}
+	if err := filterSeekable(reader, info, mcapWriter, opts); err != nil {
+		return fmt.Errorf("filter failed: %w", err)
+	}
+	if err := mcapWriter.Close(); err != nil {
+		return fmt.Errorf("failed to close writer: %w", err)
+	}
+	return nil
 }
 
 func compileMatchers(regexStrings []string) ([]regexp.Regexp, error) {
@@ -260,12 +292,12 @@ func filter(
 	// to the streaming lexer path.
 	var filterError error
 	if rs, ok := r.(io.ReadSeeker); ok {
-		reader, err := mcap.NewReader(rs)
+		mcapReader, err := mcap.NewReader(rs)
 		if err != nil {
 			return fmt.Errorf("failed to create reader: %w", err)
 		}
-		defer reader.Close()
-		info, err := reader.Info()
+		defer mcapReader.Close()
+		info, err := mcapReader.Info()
 		if err != nil {
 			return fmt.Errorf("failed to get file info: %w", err)
 		}
@@ -282,7 +314,7 @@ func filter(
 			// but we need to do it in streaming mode.
 			filterError = filterStreaming(rs, mcapWriter, opts)
 		} else {
-			filterError = filterSeekable(reader, info, mcapWriter, opts)
+			filterError = filterSeekable(mcapReader, info, mcapWriter, opts)
 		}
 	} else {
 		filterError = filterStreaming(r, mcapWriter, opts)
@@ -298,7 +330,7 @@ func filter(
 }
 
 func filterSeekable(
-	reader *mcap.Reader,
+	reader utils.MCAPReader,
 	info *mcap.Info,
 	mcapWriter *mcap.Writer,
 	opts *filterOpts,

@@ -26,24 +26,12 @@ var (
 	getAttachmentOutput string
 )
 
-func getAttachment(w io.Writer, rs io.ReadSeeker, idx *mcap.AttachmentIndex) error {
-	_, err := rs.Seek(int64(
-		idx.Offset+
-			1+ // opcode
-			8+ // record length
-			8+ // log time
-			8+ // creation time
-			4+ // name length
-			uint64(len(idx.Name))+
-			4+ // content type length
-			uint64(len(idx.MediaType))+
-			8), // data length
-		io.SeekStart)
+func getAttachment(w io.Writer, reader utils.MCAPReader, idx *mcap.AttachmentIndex) error {
+	ar, err := reader.GetAttachmentReader(idx.Offset)
 	if err != nil {
-		return fmt.Errorf("failed to seek to offset %d: %w", idx.Offset, err)
+		return fmt.Errorf("failed to get attachment reader at offset %d: %w", idx.Offset, err)
 	}
-	_, err = io.CopyN(w, rs, int64(idx.DataSize))
-	if err != nil {
+	if _, err := io.Copy(w, ar.Data()); err != nil {
 		return fmt.Errorf("failed to copy attachment to output: %w", err)
 	}
 	return nil
@@ -73,12 +61,7 @@ var getAttachmentCmd = &cobra.Command{
 			}
 		}
 
-		err = utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
-			reader, err := mcap.NewReader(rs)
-			if err != nil {
-				return fmt.Errorf("failed to construct reader: %w", err)
-			}
-			defer reader.Close()
+		extract := func(reader utils.MCAPReader) error {
 			info, err := reader.Info()
 			if err != nil {
 				return fmt.Errorf("failed to get mcap info: %w", err)
@@ -95,7 +78,7 @@ var getAttachmentCmd = &cobra.Command{
 			case len(attachments[getAttachmentName]) == 0:
 				die("attachment %s not found", getAttachmentName)
 			case len(attachments[getAttachmentName]) == 1:
-				if err := getAttachment(output, rs, attachments[getAttachmentName][0]); err != nil {
+				if err := getAttachment(output, reader, attachments[getAttachmentName][0]); err != nil {
 					die("failed to get attachment: %s", err)
 				}
 			case len(attachments[getAttachmentName]) > 1:
@@ -107,7 +90,7 @@ var getAttachmentCmd = &cobra.Command{
 				}
 				for _, idx := range attachments[getAttachmentName] {
 					if idx.Offset == getAttachmentOffset {
-						return getAttachment(output, rs, idx)
+						return getAttachment(output, reader, idx)
 					}
 				}
 				return fmt.Errorf(
@@ -117,6 +100,15 @@ var getAttachmentCmd = &cobra.Command{
 				)
 			}
 			return nil
+		}
+		newReader := utils.NewMCAPReader(ctx, filename)
+		err = utils.WithReader(ctx, filename, func(_ bool, rs io.ReadSeeker) error {
+			reader, err := newReader(rs)
+			if err != nil {
+				return fmt.Errorf("failed to construct reader: %w", err)
+			}
+			defer reader.Close()
+			return extract(reader)
 		})
 		if err != nil {
 			die("failed to extract attachment: %s", err)

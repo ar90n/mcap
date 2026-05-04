@@ -59,10 +59,12 @@ func TestSortFile(t *testing.T) {
 	}))
 	require.NoError(t, writer.Close())
 
-	// sort the file
-	reader := bytes.NewReader(buf.Bytes())
+	// sort the file. *mcap.Reader satisfies utils.MCAPReader directly.
+	reader, err := mcap.NewReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer reader.Close()
 	w := &bytes.Buffer{}
-	require.NoError(t, sortFile(w, reader))
+	require.NoError(t, sortReader(w, reader))
 
 	lexer, err := mcap.NewLexer(bytes.NewReader(w.Bytes()))
 	require.NoError(t, err)

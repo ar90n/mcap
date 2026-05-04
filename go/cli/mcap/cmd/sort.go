@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/foxglove/mcap/go/cli/mcap/utils"
 	"github.com/foxglove/mcap/go/mcap"
 	"github.com/spf13/cobra"
 )
@@ -31,35 +33,7 @@ func (e errUnindexedFile) Is(tgt error) bool {
 	return ok
 }
 
-func fileHasNoMessages(r io.ReadSeeker) (bool, error) {
-	_, err := r.Seek(0, io.SeekStart)
-	if err != nil {
-		return false, err
-	}
-	reader, err := mcap.NewReader(r)
-	if err != nil {
-		return false, err
-	}
-	defer reader.Close()
-	it, err := reader.Messages(mcap.UsingIndex(false), mcap.InOrder(mcap.FileOrder))
-	if err != nil {
-		return false, err
-	}
-	_, _, _, err = it.NextInto(nil)
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return true, nil
-		}
-		return false, err
-	}
-	return false, nil
-}
-
-func sortFile(w io.Writer, r io.ReadSeeker) error {
-	reader, err := mcap.NewReader(r)
-	if err != nil {
-		return fmt.Errorf("failed to create reader: %w", err)
-	}
+func sortReader(w io.Writer, reader utils.MCAPReader) error {
 	writer, err := mcap.NewWriter(w, &mcap.WriterOptions{
 		Chunked:     sortChunked,
 		Compression: mcap.CompressionFormat(sortCompression),
@@ -74,21 +48,16 @@ func sortFile(w io.Writer, r io.ReadSeeker) error {
 		return errUnindexedFile{err}
 	}
 
-	isEmpty, err := fileHasNoMessages(r)
-	if err != nil {
-		return fmt.Errorf("failed to check if file is empty: %w", err)
-	}
-
-	if len(info.ChunkIndexes) == 0 && !isEmpty {
+	hasMessages := info.Statistics != nil && info.Statistics.MessageCount > 0
+	if len(info.ChunkIndexes) == 0 && hasMessages {
 		return errUnindexedFile{errors.New("no chunk index records")}
 	}
 
-	err = writer.WriteHeader(info.Header)
-	if err != nil {
+	if err := writer.WriteHeader(info.Header); err != nil {
 		return fmt.Errorf("failed to write header: %w", err)
 	}
 
-	// handle the attachments and metadata metadata first; physical location in
+	// handle the attachments and metadata first; physical location in
 	// the file is irrelevant but order is preserved.
 	for _, index := range info.AttachmentIndexes {
 		attReader, err := reader.GetAttachmentReader(index.Offset)
@@ -112,8 +81,7 @@ func sortFile(w io.Writer, r io.ReadSeeker) error {
 		if err != nil {
 			return fmt.Errorf("failed to read metadata: %w", err)
 		}
-		err = writer.WriteMetadata(metadata)
-		if err != nil {
+		if err := writer.WriteMetadata(metadata); err != nil {
 			return fmt.Errorf("failed to write metadata: %w", err)
 		}
 	}
@@ -131,25 +99,23 @@ func sortFile(w io.Writer, r io.ReadSeeker) error {
 			if errors.Is(err, io.EOF) {
 				break
 			}
+			return fmt.Errorf("failed to read message: %w", err)
 		}
 		if schema != nil {
 			if _, ok := schemas[schema.ID]; !ok {
-				err := writer.WriteSchema(schema)
-				if err != nil {
+				if err := writer.WriteSchema(schema); err != nil {
 					return fmt.Errorf("failed to write schema: %w", err)
 				}
 				schemas[schema.ID] = schema
 			}
 		}
 		if _, ok := channels[channel.ID]; !ok {
-			err := writer.WriteChannel(channel)
-			if err != nil {
+			if err := writer.WriteChannel(channel); err != nil {
 				return fmt.Errorf("failed to write channel: %w", err)
 			}
 			channels[channel.ID] = channel
 		}
-		err = writer.WriteMessage(&message)
-		if err != nil {
+		if err := writer.WriteMessage(&message); err != nil {
 			return fmt.Errorf("failed to write message: %w", err)
 		}
 	}
@@ -160,21 +126,30 @@ func sortFile(w io.Writer, r io.ReadSeeker) error {
 var sortCmd = &cobra.Command{
 	Use:   "sort [file] -o output.mcap",
 	Short: "Read an MCAP file and write the messages out physically sorted on log time",
+	Long: "Read an MCAP file (or a rosbag2 metadata.yaml describing multiple " +
+		"split mcap shards) and write the messages out to a single mcap " +
+		"physically sorted on log time.",
 	Run: func(_ *cobra.Command, args []string) {
 		if len(args) != 1 {
 			die("supply a file")
 		}
-		f, err := os.Open(args[0])
-		if err != nil {
-			die("failed to open file: %s", err)
-		}
-		defer f.Close()
+		ctx := context.Background()
 
 		output, err := os.Create(sortOutputFile)
 		if err != nil {
 			die("failed to open output: %s", err)
 		}
-		err = sortFile(output, f)
+		defer output.Close()
+
+		newReader := utils.NewMCAPReader(ctx, args[0])
+		err = utils.WithReader(ctx, args[0], func(_ bool, rs io.ReadSeeker) error {
+			reader, err := newReader(rs)
+			if err != nil {
+				return fmt.Errorf("failed to create reader: %w", err)
+			}
+			defer reader.Close()
+			return sortReader(output, reader)
+		})
 		if err != nil {
 			if errors.Is(err, errUnindexedFile{}) {
 				die("Error reading file index: %s. "+
