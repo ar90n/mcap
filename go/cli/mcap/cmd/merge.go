@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"container/heap"
+	"context"
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
@@ -244,18 +245,6 @@ func (m *mcapMerger) addSchema(w *mcap.Writer, inputID int, schema *mcap.Schema)
 	return nil
 }
 
-func outputProfile(profiles []string) string {
-	if len(profiles) == 0 {
-		return ""
-	}
-	firstProfile := profiles[0]
-	for _, profile := range profiles {
-		if profile != firstProfile {
-			return ""
-		}
-	}
-	return firstProfile
-}
 
 func (m *mcapMerger) mergeInputs(w io.Writer, inputs []namedReader) error {
 	writer, err := mcap.NewWriter(w, &mcap.WriterOptions{
@@ -303,7 +292,7 @@ func (m *mcapMerger) mergeInputs(w io.Writer, inputs []namedReader) error {
 		}
 		iterators[inputID] = iterator
 	}
-	if err := writer.WriteHeader(&mcap.Header{Profile: outputProfile(profiles)}); err != nil {
+	if err := writer.WriteHeader(&mcap.Header{Profile: utils.MatchingProfile(profiles)}); err != nil {
 		return err
 	}
 	for inputID, iterator := range iterators {
@@ -503,8 +492,12 @@ var mergeCmd = &cobra.Command{
 		if mergeOutputFile == "" && !utils.StdoutRedirected() {
 			die(PleaseRedirect)
 		}
+		expanded, err := utils.ExpandRos2BagInputs(context.Background(), args)
+		if err != nil {
+			die("Failed to expand rosbag2 metadata: %s", err)
+		}
 		var readers []namedReader
-		for _, arg := range args {
+		for _, arg := range expanded {
 			f, err := os.Open(arg)
 			if err != nil {
 				die("failed to open %s: %s\n", arg, err)
@@ -537,7 +530,7 @@ var mergeCmd = &cobra.Command{
 			defer f.Close()
 			writer = f
 		}
-		err := merger.mergeInputs(writer, readers)
+		err = merger.mergeInputs(writer, readers)
 		if err != nil {
 			die("Merge failure: " + err.Error())
 		}
